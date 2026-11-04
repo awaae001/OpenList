@@ -2,7 +2,6 @@ package stream
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"io"
 	"math"
@@ -17,31 +16,13 @@ import (
 
 const windowSize = utils.MB
 
-// emptyReader keeps pooled buffers valid instead of holding a nil reader.
-var emptyReader = bytes.NewReader(nil)
-
 var windowPool = sync.Pool{New: func() any {
-	return bufio.NewReaderSize(emptyReader, windowSize)
+	return bufio.NewReaderSize(nil, windowSize)
 }}
 
 // fallbackLog counts degraded reads so the warning cannot flood the log.
 var fallbackLog atomic.Uint64
 
-func logFallback(err error) {
-	if n := fallbackLog.Add(1); n <= 3 || n%1000 == 0 {
-		log.WithError(err).Warnf("range reader falling back to unbuffered reads (count: %d)", n)
-	}
-}
-
-type closedReader struct{}
-
-func (closedReader) Read([]byte) (int, error) {
-	return 0, io.ErrClosedPipe
-}
-
-// NewBufferedRangeReader applies the server download limit using each range's
-// context. It must stay a value type: SFTP and SMB put the result into a Link
-// that may be cloned, and the returned reader is cheap to create per request.
 func NewBufferedRangeReader(file io.ReaderAt, size int64) RangeReaderFunc {
 	return func(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
 		start, length := max(r.Start, 0), r.Length
@@ -62,17 +43,35 @@ func NewBufferedRangeReader(file io.ReaderAt, size int64) RangeReaderFunc {
 			return reader, nil
 		}
 		if err := mem.MemoryGrowCheck(windowSize); err != nil {
-			logFallback(err)
+			if n := fallbackLog.Add(1); n <= 3 || n%1000 == 0 {
+				log.WithError(err).Warnf("range reader falling back to unbuffered reads (count: %d)", n)
+			}
 			return reader, nil
 		}
 		buffer := windowPool.Get().(*bufio.Reader)
 		buffer.Reset(reader.Reader)
-		reader.Reader = buffer
-		return utils.NewReadCloser(reader, sync.OnceValue(func() error {
-			reader.Reader = closedReader{}
-			buffer.Reset(emptyReader)
-			windowPool.Put(buffer)
-			return nil
-		})), nil
+		reader.Reader = &bufferedRangeReader{buffer: buffer}
+		return reader, nil
 	}
+}
+
+// Each range owns its reader; callers close it after reading has stopped.
+type bufferedRangeReader struct {
+	buffer *bufio.Reader
+}
+
+func (r *bufferedRangeReader) Read(p []byte) (int, error) {
+	if r.buffer == nil {
+		return 0, io.ErrClosedPipe
+	}
+	return r.buffer.Read(p)
+}
+
+func (r *bufferedRangeReader) Close() error {
+	if r.buffer != nil {
+		r.buffer.Reset(nil)
+		windowPool.Put(r.buffer)
+		r.buffer = nil
+	}
+	return nil
 }
